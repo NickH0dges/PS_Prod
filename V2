@@ -1,0 +1,300 @@
+# Function to log actions
+function Write-Log {
+    param ([string]$message)
+    $logFile = "$env:HOMEDRIVE\AllInOneHardening\Logs\log.txt"
+    $currentTime = Get-Date -Format "MM/dd/yyyy HH:mm:ss K"
+    $logMessage = "$currentTime - $message"
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+# Create log directory if it doesn't exist
+if (-not (Test-Path -Path "$env:HOMEDRIVE\AllInOneHardening\Logs")) {
+    New-Item -Path "$env:HOMEDRIVE\AllInOneHardening\Logs" -ItemType Directory
+}
+
+# Function to disable Windows features
+function Disable-Features {
+    $featuresToDisable = @(
+        "Printing-Server-Role", "IIS-WebServer", "IIS-FTPServer", "IIS-WebServerRole", 
+        "IIS-WebServerManagementTools", "IIS-ManagementScriptingTools", "IIS-IIS6ManagementCompatibility", 
+        "IIS-Metabase", "IIS-ManagementConsole", "RDS-RD-Server", "RDS-Licensing", 
+        "RDS-RD-Web-Access", "RDS-Connection-Broker", "RDS-Remote-Desktop", "RDS-Gateway", 
+        "RDS-RemoteApp-Server", "RDS-RemoteDesktopGateway", "RDS-RemoteDesktopSessionHost", 
+        "RDS-RD-Connection-Broker", "RDS-RD-Gateway", "RDS-RD-Licensing-Diagnosis-UI", "TelnetClient", 
+        "TelnetServer", "SMB1Protocol", "MSMQ-Server", "MSMQ-HTTP", "MSMQ-Triggers", "SimpleTCP", 
+        "SNMP", "SNMP-Service", "SNMP-WMI-Provider", "RemoteAssistance", "RemoteAssistance-Helper", 
+        "WindowsMediaPlayer", "WindowsMediaPlayer-OCX", "MediaPlayback", "MediaCenter", 
+        "MediaCenter-OCX", "Xps-Foundation-Xps-Viewer", "Xps-Viewer"
+    )
+
+    foreach ($feature in $featuresToDisable) {
+        Disable-WindowsOptionalFeature -Online -FeatureName $feature -NoRestart
+        Write-Log "Disabled feature: $feature"
+    }
+
+    Write-Host "Disabling Teredo, 6to4, and ISATAP tunneling..."
+    netsh interface teredo set state disabled
+    netsh interface ipv6 6to4 set state state=disabled undoonstop=disabled
+    netsh interface ipv6 isatap set state state=disabled
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    Write-Log "Disabled SMB1 and tunneling protocols."
+}
+
+# Function to set up firewall rules
+function Setup-Firewall {
+    Write-Host "Setting up firewall rules..."
+    Set-NetFirewallProfile -Profile @("Domain", "Public", "Private") -Enabled True
+    netsh advfirewall set allprofiles firewallpolicy "blockinbound,blockoutbound"
+    Get-NetFirewallRule | Remove-NetFirewallRule
+    Write-Log "Cleared old firewall rules."
+
+    # Example rules for inbound/outbound traffic
+    Write-Log "Firewall rules configured."
+}
+
+# Function to randomize passwords for all users except the admin
+function Randomize-Passwords {
+    Write-Host "Randomizing passwords for all users except the current administrator..."
+    $adminUser = $env:USERNAME
+    $users = Get-LocalUser | Where-Object { $_.Name -ne $adminUser }
+    foreach ($user in $users) {
+        $newPassword = [System.Web.Security.Membership]::GeneratePassword(12, 3)
+        Set-LocalUser -Name $user.Name -Password (ConvertTo-SecureString -String $newPassword -AsPlainText -Force)
+        Write-Log "Password randomized for user: $($user.Name)"
+    }
+    Write-Host "Passwords have been randomized."
+}
+
+# Function to reset machine and user passwords
+function Reset-Passwords {
+    Add-Type -AssemblyName PresentationFramework
+    $inputBox = New-Object System.Windows.Window
+    $inputBox.WindowStartupLocation = 'CenterScreen'
+    $inputBox.Width = 400
+    $inputBox.Height = 150
+    $inputBox.Title = "Set New Password"
+    $inputBox.ResizeMode = 'NoResize'
+
+    $stackPanel = New-Object System.Windows.Controls.StackPanel
+    $stackPanel.Orientation = 'Vertical'
+    $stackPanel.Margin = "10"
+
+    $label = New-Object System.Windows.Controls.Label
+    $label.Content = "Enter the new password:"
+    $stackPanel.Children.Add($label)
+
+    $passwordBox = New-Object System.Windows.Controls.PasswordBox
+    $passwordBox.Width = 250
+    $stackPanel.Children.Add($passwordBox)
+
+    $button = New-Object System.Windows.Controls.Button
+    $button.Content = "Submit"
+    $stackPanel.Children.Add($button)
+    $password = $null
+
+    $button.Add_Click({
+        $password = $passwordBox.Password
+        $inputBox.Close()
+    })
+    $inputBox.Content = $stackPanel
+    $inputBox.ShowDialog()
+
+    if ([string]::IsNullOrWhiteSpace($password)) {
+        Write-Host "No password entered." -ForegroundColor Yellow
+        return
+    }
+
+    try {
+        Reset-ComputerMachinePassword -Credential (Get-Credential) -Force
+        Write-Log "Machine password successfully reset."
+        Write-Host "Machine password reset successfully."
+    } catch {
+        Write-Log "Failed to reset machine password: $_"
+        Write-Host "Failed to reset machine password." -ForegroundColor Red
+    }
+
+    try {
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+        Set-LocalUser -Name $currentUser -Password $securePassword
+        Write-Log "Password successfully updated for user: $currentUser"
+        Write-Host "Password successfully updated for user: $currentUser"
+    } catch {
+        Write-Log "Failed to reset user password: $_"
+        Write-Host "Failed to reset user password." -ForegroundColor Red
+    }
+}
+
+# Function to check and install Windows updates
+function Run-Updates {
+    Write-Host "Checking for Windows updates..."
+    try {
+        Install-Module -Name PSWindowsUpdate -Force -ErrorAction SilentlyContinue
+        Import-Module PSWindowsUpdate
+
+        $updates = Get-WindowsUpdate -AcceptAll -Install -AutoReboot
+
+        if ($updates) {
+            Write-Log "Updates installed successfully: $($updates | Out-String)"
+            Write-Host "Updates installed successfully. Some updates may require a reboot."
+        } else {
+            Write-Log "No updates were available or installed."
+            Write-Host "No updates were available or installed."
+        }
+    } catch {
+        Write-Log "Failed to run updates: $_"
+        Write-Host "Failed to run updates. Please check the logs for details." -ForegroundColor Red
+    }
+}
+
+# Infodump - Windows Enumeration Script
+function Infodump {
+    $outputFile = "$env:USERPROFILE\Desktop\infodump_report.txt"
+    Start-Transcript -Path $outputFile -Append
+
+    Write-Host "Starting Windows system enumeration... Please wait."
+
+    # Section 1: OS Information
+    Write-Host "`n====================="
+    Write-Host "===*******OS******==="
+    Write-Host "=====================`n"
+    Write-Output "=== OS Information ==="
+    Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsArchitecture, Manufacturer, InstallDate | Format-Table -AutoSize
+
+    # Section 2: Users
+    Write-Host "`n========================="
+    Write-Host "===*******USERS*******==="
+    Write-Host "=========================`n"
+    Write-Output "=== Users ==="
+    Get-LocalUser | Format-Table Name, Enabled, LastLogon -AutoSize
+
+    # Section 3: Groups
+    Write-Host "`n=========================="
+    Write-Host "===*******GROUPS*******==="
+    Write-Host "==========================`n"
+    Write-Output "=== Groups ==="
+    Get-LocalGroup | Format-Table Name, Description -AutoSize
+
+    # Section 4: Admin/Sudo Users
+    Write-Host "`n==========================="
+    Write-Host "===*******SUDOERS*******==="
+    Write-Host "===========================`n"
+    Write-Output "=== Admin Users ==="
+    Get-LocalGroupMember -Group "Administrators" | Format-Table Name, ObjectClass
+
+    # Section 5: Network Configuration
+    Write-Host "`n=================================="
+    Write-Host "===*******NETWORK CONFIG*******==="
+    Write-Host "==================================`n"
+    Write-Output "=== Network Configuration ==="
+    Get-NetIPAddress | Format-Table InterfaceAlias, IPAddress, AddressFamily
+    Write-Output "`n=== Hosts File ==="
+    Get-Content "C:\Windows\System32\drivers\etc\hosts"
+    Write-Output "`n=== DNS Configuration ==="
+    Get-DnsClientServerAddress | Format-Table InterfaceAlias, ServerAddresses
+
+    # Section 6: Network Connections with PID and Process Name
+    Write-Host "`n====================================="
+    Write-Host "===*******NETWORK CONNECTIONS*******==="
+    Write-Host "=====================================`n"
+    Write-Output "=== Active Network Connections with Process Name ==="
+
+    Get-NetTCPConnection | ForEach-Object {
+        $processId = $_.OwningProcess
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+
+        [PSCustomObject]@{
+            LocalAddress  = $_.LocalAddress
+            LocalPort     = $_.LocalPort
+            RemoteAddress = $_.RemoteAddress
+            RemotePort    = $_.RemotePort
+            State         = $_.State
+            ProcessID     = $processId
+            ProcessName   = $process.ProcessName
+        }
+    } | Format-Table -AutoSize
+
+    # Section 7: Scheduled Tasks
+    Write-Host "`n============================"
+    Write-Host "===*******SCHEDULED TASKS*******==="
+    Write-Host "============================`n"
+    Write-Output "=== Scheduled Tasks ==="
+    Get-ScheduledTask | Format-Table TaskName, State, LastRunTime
+
+    # Section 8: Active Processes
+    Write-Host "`n===================================="
+    Write-Host "===*******ACTIVE PROCESSES*******==="
+    Write-Host "====================================`n"
+    Write-Output "=== Active Processes ==="
+    Get-Process | Sort-Object CPU -Descending | Format-Table Id, ProcessName, CPU, StartTime -AutoSize
+
+    # Section 9: Running Services
+    Write-Host "`n==================================="
+    Write-Host "===*******ACTIVE SERVICES*******==="
+    Write-Host "==================================`n"
+    Write-Output "=== Running Services ==="
+    Get-Service | Where-Object {$_.Status -eq 'Running'} | Format-Table Name, DisplayName, Status
+
+    # Section 10: Searching for Executables with Special Permissions (SUID/SGID equivalent)
+    Write-Host "`n==========================================="
+    Write-Host "===*******SPECIAL PERMISSIONS EXECUTABLES*******==="
+    Write-Host "===========================================`n"
+    Write-Output "=== Executables with Special Permissions ==="
+    $directories = @("C:\Windows\System32", "C:\Program Files", "C:\Program Files (x86)")
+    foreach ($dir in $directories) {
+        Get-ChildItem -Path $dir -Recurse -ErrorAction SilentlyContinue |
+        Where-Object {($_.Attributes -match "Archive") -and ($_.Mode -match "s")} |
+        Format-Table FullName, Mode
+    }
+
+    Stop-Transcript
+    Write-Host "`nEnumeration completed! Report saved at: $outputFile"
+}
+
+# Main menu for user interaction
+function Show-Menu {
+    Write-Host "`nSelect an option:"
+    Write-Host "1. Disable Windows Features (Including EternalBlue Hardening)"
+    Write-Host "2. Set Up Firewall"
+    Write-Host "3. Randomize User Passwords (Except Administrator)"
+    Write-Host "4. Reset Machine and User Passwords"
+    Write-Host "5. Run Infodump (Windows Enumeration)"
+    Write-Host "6. Run Updates (Windows Updates)"
+    Write-Host "E. Exit"
+}
+
+# Main script loop
+$choice = ""
+while ($choice -ne "E") {
+    Show-Menu
+    $choice = Read-Host "Enter your choice"
+    switch ($choice) {
+        "1" {
+            Disable-Features
+        }
+        "2" {
+            Setup-Firewall
+        }
+        "3" {
+            Randomize-Passwords
+        }
+        "4" {
+            Reset-Passwords
+        }
+        "5" {
+            Infodump
+        }
+        "6" {
+            Run-Updates
+        }
+        "E" {
+            Write-Host "Exiting script..."
+            Write-Log "Script exited by user."
+        }
+        default {
+            Write-Host "Invalid choice, please try again."
+        }
+    }
+}
+
+Read-Host "Press Enter to exit..."
