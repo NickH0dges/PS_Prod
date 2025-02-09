@@ -1,22 +1,7 @@
-param (
-    [string]$CsvFilePath = "C:\Passwords\user_passwords.csv"
-)
+param ()
 
 # Import Active Directory module
 Import-Module ActiveDirectory
-
-# Function to create a sample CSV file if it doesn't exist
-function Create-SampleCsv {
-    if (!(Test-Path $CsvFilePath)) {
-        Write-Warning "CSV file not found. Creating a sample file at $CsvFilePath..."
-        @"
-Username,Password
-user1,NewPassword1
-user2,NewPassword2
-"@ | Out-File -FilePath $CsvFilePath -Encoding UTF8
-        Write-Output "Sample CSV file created. Please update it with the correct user data."
-    }
-}
 
 # Function to change the machine password
 function Change-MachinePassword {
@@ -58,33 +43,9 @@ function Change-CurrentUserPassword {
     }
 }
 
-# Function to change user passwords from a CSV file
-function Change-UserPasswords {
-    if (!(Test-Path $CsvFilePath)) {
-        Write-Error "CSV file not found at $CsvFilePath"
-        return
-    }
-
-    $Users = Import-Csv -Path $CsvFilePath
-    
-    foreach ($User in $Users) {
-        $Username = $User.Username
-        $NewPassword = ConvertTo-SecureString $User.Password -AsPlainText -Force
-        
-        try {
-            Set-ADAccountPassword -Identity $Username -NewPassword $NewPassword -Reset
-            Write-Output "Password changed for user: $Username"
-        } catch {
-            Write-Error "Failed to change password for user $Username: $($_.Exception.Message)"
-        }
-    }
-}
-
 # Main Execution
 Write-Output "Starting password reset operations..."
-Create-SampleCsv
 Change-MachinePassword
 Verify-MachinePasswordChange
 Change-CurrentUserPassword
-Change-UserPasswords
 Write-Output "Password reset process completed."
