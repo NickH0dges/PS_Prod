@@ -1,0 +1,51 @@
+param ()
+
+# Import Active Directory module
+Import-Module ActiveDirectory
+
+# Function to change the machine password
+function Change-MachinePassword {
+    try {
+        Reset-ComputerMachinePassword -Server (Get-ADDomainController).HostName
+        Write-Output "Machine password successfully reset."
+    } catch {
+        Write-Error "Failed to reset machine password: $($_.Exception.Message)"
+    }
+}
+
+# Function to verify the machine password change
+function Verify-MachinePasswordChange {
+    try {
+        # Get the machine account details from AD
+        $ComputerName = $env:COMPUTERNAME + "$" # Machine account name in AD
+        $ComputerObject = Get-ADComputer -Identity $ComputerName -Properties pwdLastSet
+
+        if ($ComputerObject) {
+            $LastSet = Get-Date -Date $ComputerObject.pwdLastSet -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Output "The machine password was last set on: $LastSet"
+            Write-Output "Compare this timestamp to verify if the password was recently changed."
+        } else {
+            Write-Error "Unable to find the machine account in Active Directory."
+        }
+    } catch {
+        Write-Error "Failed to retrieve machine account details: $($_.Exception.Message)"
+    }
+}
+
+# Function to change the current user's password
+function Change-CurrentUserPassword {
+    try {
+        $NewPassword = Read-Host "Enter new password for current user" -AsSecureString
+        Set-ADAccountPassword -Identity $env:USERNAME -NewPassword $NewPassword -Reset
+        Write-Output "Password successfully changed for user: $env:USERNAME"
+    } catch {
+        Write-Error "Failed to change password for current user: $($_.Exception.Message)"
+    }
+}
+
+# Main Execution
+Write-Output "Starting password reset operations..."
+Change-MachinePassword
+Verify-MachinePasswordChange
+Change-CurrentUserPassword
+Write-Output "Password reset process completed."
