@@ -33,20 +33,15 @@ function Disable-Features {
     }
 
     # Disable EternalBlue-related services (SMB1, Teredo, etc.)
-    Write-Host "Disabling Teredo, 6to4, and ISATAP tunneling..."
     netsh interface teredo set state disabled
     netsh interface ipv6 6to4 set state state=disabled undoonstop=disabled
     netsh interface ipv6 isatap set state state=disabled
     Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
-    Write-Host "Disabled SMB1 (EternalBlue), Teredo, 6to4, and ISATAP"
     Write-Log "Disabled SMB1 and tunneling protocols."
 }
 
 # Function to set up firewall rules
 function Setup-Firewall {
-    Write-Host "Setting up firewall rules..."
-    
-    # Enable firewall for all profiles
     Set-NetFirewallProfile -Profile @("Domain", "Public", "Private") -Enabled True
     Write-Log "Enabled firewall for all profiles."
 
@@ -54,11 +49,7 @@ function Setup-Firewall {
     netsh advfirewall set allprofiles firewallpolicy "blockinbound,blockoutbound"
     Write-Log "Set firewall policy to block all inbound/outbound."
 
-    # Clear old firewall rules
-    Get-NetFirewallRule | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-    Write-Log "Cleared old firewall rules."
-
-    # Define ports
+    # Define allowed ports
     $allowedPorts = @(53, 80, 443, 8080, 9997)
 
     foreach ($port in $allowedPorts) {
@@ -70,13 +61,10 @@ function Setup-Firewall {
     # Allow ICMP for troubleshooting
     New-NetFirewallRule -DisplayName "ICMP Inbound" -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow
     Write-Log "Allowed ICMP inbound."
-
-    Write-Host "Firewall setup complete."
 }
 
 # Function to randomize passwords for all users except admin
 function Randomize-Passwords {
-    Write-Host "Randomizing passwords for all users except the current administrator..."
     $adminUser = $env:USERNAME
     $users = Get-LocalUser | Where-Object { $_.Name -ne $adminUser }
     
@@ -84,7 +72,6 @@ function Randomize-Passwords {
         $newPassword = -join ((33..126) | Get-Random -Count 14 | ForEach-Object { [char]$_ })
         Set-LocalUser -Name $user.Name -Password (ConvertTo-SecureString -String $newPassword -AsPlainText -Force)
         Write-Log "Password randomized for user: $($user.Name)"
-        Write-Host "Password randomized for user: $($user.Name)"
     }
 }
 
@@ -111,27 +98,45 @@ function Zerologon {
     $NewValue = 1
 
     if (-not (Test-Path $RegistryPath)) {
-        Write-Host "Registry path does not exist: $RegistryPath" -ForegroundColor Red
-        exit
+        Write-Log "Registry path does not exist: $RegistryPath"
+        return
     }
 
-    try {
-        Set-ItemProperty -Path $RegistryPath -Name $ValueName -Value $NewValue -Force
-        Write-Log "Successfully hardened Netlogon (Zerologon fix applied)"
-        Write-Host "Successfully applied Zerologon mitigation." -ForegroundColor Green
-    } catch {
-        Write-Host "Failed to modify registry. Error: $_" -ForegroundColor Red
-    }
+    Set-ItemProperty -Path $RegistryPath -Name $ValueName -Value $NewValue -Force
+    Write-Log "Successfully hardened Netlogon (Zerologon fix applied)"
+}
+
+# Function for system enumeration (infodump)
+function System-Enumeration {
+    $outputFile = "$env:USERPROFILE\Desktop\infodump_report.txt"
+    Start-Transcript -Path $outputFile -Append
+    Write-Log "System enumeration started."
+
+    Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsArchitecture, Manufacturer, InstallDate | Format-Table -AutoSize
+    Get-LocalUser | Format-Table Name, Enabled, LastLogon -AutoSize
+    Get-NetIPAddress | Format-Table InterfaceAlias, IPAddress, AddressFamily
+
+    Stop-Transcript
+    Write-Log "System enumeration completed and saved to: $outputFile."
+}
+
+# Function to upgrade SMB
+function Upgrade-SMB {
+    Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    Write-Log "Upgraded SMB1 to SMB2 and disabled SMB1."
 }
 
 # Main menu for user interaction
 function Show-Menu {
     Write-Host "`nSelect an option:"
-    Write-Host "1. Disable Windows Features (Including EternalBlue Hardening)"
+    Write-Host "1. Disable Windows Features"
     Write-Host "2. Set Up Firewall"
-    Write-Host "3. Randomize User Passwords (Except Administrator)"
-    Write-Host "4. Install Sysinternals Suite"
-    Write-Host "5. Apply Zerologon Mitigation"
+    Write-Host "3. Randomize User Passwords"
+    Write-Host "4. System Enumeration"
+    Write-Host "5. Install Sysinternals Suite"
+    Write-Host "6. Apply Zerologon Mitigation"
+    Write-Host "7. Upgrade SMB 1 to SMB 2"
     Write-Host "E. Exit"
 }
 
@@ -144,9 +149,11 @@ while ($choice -ne "E") {
         "1" { Disable-Features }
         "2" { Setup-Firewall }
         "3" { Randomize-Passwords }
-        "4" { Sysinternals-Install }
-        "5" { Zerologon }
-        "E" { Write-Host "Exiting script..." ; Write-Log "Script exited by user." }
+        "4" { System-Enumeration }
+        "5" { Sysinternals-Install }
+        "6" { Zerologon }
+        "7" { Upgrade-SMB }
+        "E" { Write-Log "Script exited by user." }
         default { Write-Host "Invalid choice, please try again." }
     }
 }
