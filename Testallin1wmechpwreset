@@ -1,0 +1,202 @@
+# Function to log actions
+function Write-Log {
+    param ([string]$message)
+    $logFile = "$env:SystemDrive\AllInOneHardening\Logs\log.txt"
+    $currentTime = Get-Date -Format "MM/dd/yyyy HH:mm:ss K"
+    $logMessage = "$currentTime - $message"
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+# Create log directory if it doesn't exist
+if (-not (Test-Path -Path "$env:SystemDrive\AllInOneHardening\Logs")) {
+    New-Item -Path "$env:SystemDrive\AllInOneHardening\Logs" -ItemType Directory -Force | Out-Null
+}
+
+# Function to disable Windows features
+function Disable-Features {
+    $featuresToDisable = @(
+        "Printing-Server-Role", "IIS-WebServer", "IIS-FTPServer", "IIS-WebServerRole", 
+        "IIS-WebServerManagementTools", "IIS-ManagementScriptingTools", "IIS-IIS6ManagementCompatibility", 
+        "IIS-Metabase", "IIS-ManagementConsole", "RDS-RD-Server", "RDS-Licensing", 
+        "RDS-RD-Web-Access", "RDS-Connection-Broker", "RDS-Remote-Desktop", "RDS-Gateway", 
+        "RDS-RemoteApp-Server", "RDS-RemoteDesktopGateway", "RDS-RemoteDesktopSessionHost", 
+        "RDS-RD-Connection-Broker", "RDS-RD-Gateway", "RDS-RD-Licensing-Diagnosis-UI", "TelnetClient", 
+        "TelnetServer", "SMB1Protocol", "MSMQ-Server", "MSMQ-HTTP", "MSMQ-Triggers", "SimpleTCP", 
+        "SNMP", "SNMP-Service", "SNMP-WMI-Provider", "RemoteAssistance", "RemoteAssistance-Helper", 
+        "WindowsMediaPlayer", "WindowsMediaPlayer-OCX", "MediaPlayback", "MediaCenter", 
+        "MediaCenter-OCX", "Xps-Foundation-Xps-Viewer", "Xps-Viewer"
+    )
+
+    foreach ($feature in $featuresToDisable) {
+        Disable-WindowsOptionalFeature -Online -FeatureName $feature -NoRestart -ErrorAction SilentlyContinue
+        Write-Log "Disabled feature: $feature"
+    }
+
+    # Disable EternalBlue-related services (SMB1, Teredo, etc.)
+    netsh interface teredo set state disabled
+    netsh interface ipv6 6to4 set state state=disabled undoonstop=disabled
+    netsh interface ipv6 isatap set state state=disabled
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    Write-Log "Disabled SMB1 and tunneling protocols."
+}
+
+# Function to set up firewall rules
+function Setup-Firewall {
+    Set-NetFirewallProfile -Profile @("Domain", "Public", "Private") -Enabled True
+    Write-Log "Enabled firewall for all profiles."
+
+    # Block all inbound & outbound traffic by default
+    netsh advfirewall set allprofiles firewallpolicy "blockinbound,blockoutbound"
+    Write-Log "Set firewall policy to block all inbound/outbound."
+
+    # Define allowed ports
+    $allowedPorts = @(53, 80, 443, 8080, 9997)
+
+    foreach ($port in $allowedPorts) {
+        New-NetFirewallRule -DisplayName "Allow TCP Port $port" -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow
+        New-NetFirewallRule -DisplayName "Allow UDP Port $port" -Direction Inbound -Protocol UDP -LocalPort $port -Action Allow
+        Write-Log "Allowed inbound port $port"
+    }
+
+    # Allow ICMP for troubleshooting
+    New-NetFirewallRule -DisplayName "ICMP Inbound" -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow
+    Write-Log "Allowed ICMP inbound."
+}
+
+# Function to change the machine password
+function Randomize-Passwords {
+    # Import Active Directory module
+Import-Module ActiveDirectory
+
+# Function to change the machine password
+function Change-MachinePassword {
+    try {
+        Reset-ComputerMachinePassword -Server (Get-ADDomainController).HostName
+        Write-Output "Machine password successfully reset."
+    } catch {
+        Write-Error "Failed to reset machine password: $($_.Exception.Message)"
+    }
+}
+
+# Function to verify the machine password change
+function Verify-MachinePasswordChange {
+    try {
+        # Get the machine account details from AD
+        $ComputerName = $env:COMPUTERNAME + "$" # Machine account name in AD
+        $ComputerObject = Get-ADComputer -Identity $ComputerName -Properties pwdLastSet
+
+        if ($ComputerObject) {
+            $LastSet = Get-Date -Date $ComputerObject.pwdLastSet -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Output "The machine password was last set on: $LastSet"
+            Write-Output "Compare this timestamp to verify if the password was recently changed."
+        } else {
+            Write-Error "Unable to find the machine account in Active Directory."
+        }
+    } catch {
+        Write-Error "Failed to retrieve machine account details: $($_.Exception.Message)"
+    }
+}
+
+# Function to change the current user's password
+function Change-CurrentUserPassword {
+    try {
+        $NewPassword = Read-Host "Enter new password for current user" -AsSecureString
+        Set-ADAccountPassword -Identity $env:USERNAME -NewPassword $NewPassword -Reset
+        Write-Output "Password successfully changed for user: $env:USERNAME"
+    } catch {
+        Write-Error "Failed to change password for current user: $($_.Exception.Message)"
+    }
+}
+
+# Main Execution
+Write-Output "Starting password reset operations..."
+Change-MachinePassword
+Verify-MachinePasswordChange
+Change-CurrentUserPassword
+Write-Output "Password reset process completed."
+}
+
+# Function to install Sysinternals Suite
+function Sysinternals-Install {
+    $downloadUrl = "https://download.sysinternals.com/files/SysinternalsSuite.zip"
+    $installPath = "C:\SysinternalsSuite"
+
+    if (-Not (Test-Path $installPath)) {
+        New-Item -ItemType Directory -Path $installPath -Force | Out-Null
+    }
+
+    $zipFile = "$installPath\SysinternalsSuite.zip"
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile
+    Expand-Archive -Path $zipFile -DestinationPath $installPath -Force
+    Remove-Item -Path $zipFile -Force
+    Write-Log "Sysinternals Suite installed at $installPath"
+}
+
+# Zerologon Mitigation - Harden Netlogon
+function Zerologon {
+    $RegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters"
+    $ValueName = "FullSecureChannelProtection"
+    $NewValue = 1
+
+    if (-not (Test-Path $RegistryPath)) {
+        Write-Log "Registry path does not exist: $RegistryPath"
+        return
+    }
+
+    Set-ItemProperty -Path $RegistryPath -Name $ValueName -Value $NewValue -Force
+    Write-Log "Successfully hardened Netlogon (Zerologon fix applied)"
+}
+
+# Function for system enumeration (infodump)
+function System-Enumeration {
+    $outputFile = "$env:USERPROFILE\Desktop\infodump_report.txt"
+    Start-Transcript -Path $outputFile -Append
+    Write-Log "System enumeration started."
+
+    Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsArchitecture, Manufacturer, InstallDate | Format-Table -AutoSize
+    Get-LocalUser | Format-Table Name, Enabled, LastLogon -AutoSize
+    Get-NetIPAddress | Format-Table InterfaceAlias, IPAddress, AddressFamily
+
+    Stop-Transcript
+    Write-Log "System enumeration completed and saved to: $outputFile."
+}
+
+# Function to upgrade SMB
+function Upgrade-SMB {
+    Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    Write-Log "Upgraded SMB1 to SMB2 and disabled SMB1."
+}
+
+# Main menu for user interaction
+function Show-Menu {
+    Write-Host "`nSelect an option:"
+    Write-Host "1. Disable Windows Features"
+    Write-Host "2. Set Up Firewall"
+    Write-Host "3. Randomize User Passwords"
+    Write-Host "4. System Enumeration"
+    Write-Host "5. Install Sysinternals Suite"
+    Write-Host "6. Apply Zerologon Mitigation"
+    Write-Host "7. Upgrade SMB 1 to SMB 2"
+    Write-Host "E. Exit"
+}
+
+# Main script loop
+$choice = ""
+while ($choice -ne "E") {
+    Show-Menu
+    $choice = Read-Host "Enter your choice"
+    switch ($choice) {
+        "1" { Disable-Features }
+        "2" { Setup-Firewall }
+        "3" { Randomize-Passwords }
+        "4" { System-Enumeration }
+        "5" { Sysinternals-Install }
+        "6" { Zerologon }
+        "7" { Upgrade-SMB }
+        "E" { Write-Log "Script exited by user." }
+        default { Write-Host "Invalid choice, please try again." }
+    }
+}
+
+Read-Host "Press Enter to exit..."
