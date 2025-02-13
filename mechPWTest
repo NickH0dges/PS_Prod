@@ -1,0 +1,90 @@
+param (
+    [string]$CsvFilePath = "C:\Passwords\user_passwords.csv"
+)
+
+# Import Active Directory module
+Import-Module ActiveDirectory
+
+# Function to create a sample CSV file if it doesn't exist
+function Create-SampleCsv {
+    if (!(Test-Path $CsvFilePath)) {
+        Write-Warning "CSV file not found. Creating a sample file at $CsvFilePath..."
+        @"
+Username,Password
+user1,NewPassword1
+user2,NewPassword2
+"@ | Out-File -FilePath $CsvFilePath -Encoding UTF8
+        Write-Output "Sample CSV file created. Please update it with the correct user data."
+    }
+}
+
+# Function to change the machine password
+function Change-MachinePassword {
+    try {
+        Reset-ComputerMachinePassword -Server (Get-ADDomainController).HostName
+        Write-Output "Machine password successfully reset."
+    } catch {
+        Write-Error "Failed to reset machine password: $($_.Exception.Message)"
+    }
+}
+
+# Function to verify the machine password change
+function Verify-MachinePasswordChange {
+    try {
+        # Get the machine account details from AD
+        $ComputerName = $env:COMPUTERNAME + "$" # Machine account name in AD
+        $ComputerObject = Get-ADComputer -Identity $ComputerName -Properties pwdLastSet
+
+        if ($ComputerObject) {
+            $LastSet = Get-Date -Date $ComputerObject.pwdLastSet -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Output "The machine password was last set on: $LastSet"
+            Write-Output "Compare this timestamp to verify if the password was recently changed."
+        } else {
+            Write-Error "Unable to find the machine account in Active Directory."
+        }
+    } catch {
+        Write-Error "Failed to retrieve machine account details: $($_.Exception.Message)"
+    }
+}
+
+# Function to change the current user's password
+function Change-CurrentUserPassword {
+    try {
+        $NewPassword = Read-Host "Enter new password for current user" -AsSecureString
+        Set-ADAccountPassword -Identity $env:USERNAME -NewPassword $NewPassword -Reset
+        Write-Output "Password successfully changed for user: $env:USERNAME"
+    } catch {
+        Write-Error "Failed to change password for current user: $($_.Exception.Message)"
+    }
+}
+
+# Function to change user passwords from a CSV file
+function Change-UserPasswords {
+    if (!(Test-Path $CsvFilePath)) {
+        Write-Error "CSV file not found at $CsvFilePath"
+        return
+    }
+
+    $Users = Import-Csv -Path $CsvFilePath
+    
+    foreach ($User in $Users) {
+        $Username = $User.Username
+        $NewPassword = ConvertTo-SecureString $User.Password -AsPlainText -Force
+        
+        try {
+            Set-ADAccountPassword -Identity $Username -NewPassword $NewPassword -Reset
+            Write-Output "Password changed for user: $Username"
+        } catch {
+            Write-Error "Failed to change password for user $Username: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Main Execution
+Write-Output "Starting password reset operations..."
+Create-SampleCsv
+Change-MachinePassword
+Verify-MachinePasswordChange
+Change-CurrentUserPassword
+Change-UserPasswords
+Write-Output "Password reset process completed."
