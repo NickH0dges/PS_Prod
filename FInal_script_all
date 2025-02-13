@@ -1,0 +1,154 @@
+# Function to log actions
+function Write-Log {
+    param ([string]$message)
+    $logFile = "$env:SystemDrive\AllInOneHardening\Logs\log.txt"
+    $currentTime = Get-Date -Format "MM/dd/yyyy HH:mm:ss K"
+    $logMessage = "$currentTime - $message"
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+# Create log directory if it doesn't exist
+if (-not (Test-Path -Path "$env:SystemDrive\AllInOneHardening\Logs")) {
+    New-Item -Path "$env:SystemDrive\AllInOneHardening\Logs" -ItemType Directory -Force | Out-Null
+}
+
+# Function to disable Windows features
+function Disable-Features {
+    $featuresToDisable = @(
+        "Printing-Server-Role", "IIS-WebServer", "IIS-FTPServer", "IIS-WebServerRole", 
+        "IIS-WebServerManagementTools", "IIS-ManagementScriptingTools", "IIS-IIS6ManagementCompatibility", 
+        "IIS-Metabase", "IIS-ManagementConsole", "RDS-RD-Server", "RDS-Licensing", 
+        "RDS-RD-Web-Access", "RDS-Connection-Broker", "RDS-Remote-Desktop", "RDS-Gateway", 
+        "RDS-RemoteApp-Server", "RDS-RemoteDesktopGateway", "RDS-RemoteDesktopSessionHost", 
+        "RDS-RD-Connection-Broker", "RDS-RD-Gateway", "RDS-RD-Licensing-Diagnosis-UI", "TelnetClient", 
+        "TelnetServer", "SMB1Protocol", "MSMQ-Server", "MSMQ-HTTP", "MSMQ-Triggers", "SimpleTCP", 
+        "SNMP", "SNMP-Service", "SNMP-WMI-Provider", "RemoteAssistance", "RemoteAssistance-Helper", 
+        "WindowsMediaPlayer", "WindowsMediaPlayer-OCX", "MediaPlayback", "MediaCenter", 
+        "MediaCenter-OCX", "Xps-Foundation-Xps-Viewer", "Xps-Viewer"
+    )
+
+    foreach ($feature in $featuresToDisable) {
+        Disable-WindowsOptionalFeature -Online -FeatureName $feature -NoRestart -ErrorAction SilentlyContinue
+        Write-Log "Disabled feature: $feature"
+    }
+
+    # Disable EternalBlue-related services (SMB1, Teredo, etc.)
+    Write-Host "Disabling Teredo, 6to4, and ISATAP tunneling..."
+    netsh interface teredo set state disabled
+    netsh interface ipv6 6to4 set state state=disabled undoonstop=disabled
+    netsh interface ipv6 isatap set state state=disabled
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    Write-Host "Disabled SMB1 (EternalBlue), Teredo, 6to4, and ISATAP"
+    Write-Log "Disabled SMB1 and tunneling protocols."
+}
+
+# Function to set up firewall rules
+function Setup-Firewall {
+    Write-Host "Setting up firewall rules..."
+    
+    # Enable firewall for all profiles
+    Set-NetFirewallProfile -Profile @("Domain", "Public", "Private") -Enabled True
+    Write-Log "Enabled firewall for all profiles."
+
+    # Block all inbound & outbound traffic by default
+    netsh advfirewall set allprofiles firewallpolicy "blockinbound,blockoutbound"
+    Write-Log "Set firewall policy to block all inbound/outbound."
+
+    # Clear old firewall rules
+    Get-NetFirewallRule | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    Write-Log "Cleared old firewall rules."
+
+    # Define ports
+    $allowedPorts = @(53, 80, 443, 8080, 9997)
+
+    foreach ($port in $allowedPorts) {
+        New-NetFirewallRule -DisplayName "Allow TCP Port $port" -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow
+        New-NetFirewallRule -DisplayName "Allow UDP Port $port" -Direction Inbound -Protocol UDP -LocalPort $port -Action Allow
+        Write-Log "Allowed inbound port $port"
+    }
+
+    # Allow ICMP for troubleshooting
+    New-NetFirewallRule -DisplayName "ICMP Inbound" -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow
+    Write-Log "Allowed ICMP inbound."
+
+    Write-Host "Firewall setup complete."
+}
+
+# Function to randomize passwords for all users except admin
+function Randomize-Passwords {
+    Write-Host "Randomizing passwords for all users except the current administrator..."
+    $adminUser = $env:USERNAME
+    $users = Get-LocalUser | Where-Object { $_.Name -ne $adminUser }
+    
+    foreach ($user in $users) {
+        $newPassword = -join ((33..126) | Get-Random -Count 14 | ForEach-Object { [char]$_ })
+        Set-LocalUser -Name $user.Name -Password (ConvertTo-SecureString -String $newPassword -AsPlainText -Force)
+        Write-Log "Password randomized for user: $($user.Name)"
+        Write-Host "Password randomized for user: $($user.Name)"
+    }
+}
+
+# Function to install Sysinternals Suite
+function Sysinternals-Install {
+    $downloadUrl = "https://download.sysinternals.com/files/SysinternalsSuite.zip"
+    $installPath = "C:\SysinternalsSuite"
+
+    if (-Not (Test-Path $installPath)) {
+        New-Item -ItemType Directory -Path $installPath -Force | Out-Null
+    }
+
+    $zipFile = "$installPath\SysinternalsSuite.zip"
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile
+    Expand-Archive -Path $zipFile -DestinationPath $installPath -Force
+    Remove-Item -Path $zipFile -Force
+    Write-Log "Sysinternals Suite installed at $installPath"
+}
+
+# Zerologon Mitigation - Harden Netlogon
+function Zerologon {
+    $RegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters"
+    $ValueName = "FullSecureChannelProtection"
+    $NewValue = 1
+
+    if (-not (Test-Path $RegistryPath)) {
+        Write-Host "Registry path does not exist: $RegistryPath" -ForegroundColor Red
+        exit
+    }
+
+    try {
+        Set-ItemProperty -Path $RegistryPath -Name $ValueName -Value $NewValue -Force
+        Write-Log "Successfully hardened Netlogon (Zerologon fix applied)"
+        Write-Host "Successfully applied Zerologon mitigation." -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to modify registry. Error: $_" -ForegroundColor Red
+    }
+}
+
+# Main menu for user interaction
+function Show-Menu {
+    Write-Host "`nSelect an option:"
+    Write-Host "1. Disable Windows Features (Including EternalBlue Hardening)"
+    Write-Host "2. Set Up Firewall"
+    Write-Host "3. Randomize User Passwords (Except Administrator)"
+    Write-Host "4. Install Sysinternals Suite"
+    Write-Host "5. Apply Zerologon Mitigation"
+    Write-Host "E. Exit"
+}
+
+# Main script loop
+$choice = ""
+while ($choice -ne "E") {
+    Show-Menu
+    $choice = Read-Host "Enter your choice"
+    switch ($choice) {
+        "1" { Disable-Features }
+        "2" { Setup-Firewall }
+        "3" { Randomize-Passwords }
+        "4" { Sysinternals-Install }
+        "5" { Zerologon }
+        "E" { Write-Host "Exiting script..." ; Write-Log "Script exited by user." }
+        default { Write-Host "Invalid choice, please try again." }
+    }
+}
+
+Read-Host "Press Enter to exit..."
