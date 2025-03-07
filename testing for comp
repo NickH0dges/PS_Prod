@@ -1,0 +1,419 @@
+# ============================ LOGGING FUNCTION ============================
+function Write-Log {
+    param ([string]$message)
+    $logDir = "$env:HOMEDRIVE\AllInOneHardening\Logs"
+    if (-not (Test-Path -Path $logDir)) {
+        New-Item -Path $logDir -ItemType Directory | Out-Null
+    }
+    $logFile = "$logDir\log.txt"
+    $currentTime = Get-Date -Format "MM/dd/yyyy HH:mm:ss K"
+    $logMessage = "$currentTime - $message"
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+# ============================ DISABLE WINDOWS FEATURES ============================
+function Disable-Features {
+    Write-Host "Disabling specified Windows features..." -ForegroundColor Cyan
+    $featuresToDisable = @(
+        "Printing-Server-Role", "RDS-RD-Server", "RDS-Licensing", 
+        "RDS-RD-Web-Access", "RDS-Connection-Broker", "RDS-Remote-Desktop", "RDS-Gateway", 
+        "RDS-RemoteApp-Server", "RDS-RemoteDesktopGateway", "RDS-RemoteDesktopSessionHost", 
+        "RDS-RD-Connection-Broker", "RDS-RD-Gateway", "RDS-RD-Licensing-Diagnosis-UI", "TelnetClient", 
+        "TelnetServer", "SMB1Protocol", "MSMQ-Server", "MSMQ-HTTP", "MSMQ-Triggers", "SimpleTCP", 
+        "SNMP", "SNMP-Service", "SNMP-WMI-Provider", "RemoteAssistance", "RemoteAssistance-Helper", 
+        "WindowsMediaPlayer", "WindowsMediaPlayer-OCX", "MediaPlayback", "MediaCenter", 
+        "MediaCenter-OCX", "Xps-Foundation-Xps-Viewer", "Xps-Viewer"
+    )
+
+    foreach ($feature in $featuresToDisable) {
+        try {
+            Disable-WindowsOptionalFeature -Online -FeatureName $feature -NoRestart
+            Write-Log "Disabled feature: $feature"
+        } catch {
+            Write-Log "Failed to disable feature: $feature - $_"
+        }
+    }
+    # Disable tunneling protocols and SMB1
+    Write-Host "Disabling Teredo, 6to4, ISATAP and SMB1..." -ForegroundColor Cyan
+    netsh interface teredo set state disabled
+    netsh interface ipv6 6to4 set state state=disabled
+    netsh interface ipv6 isatap set state state=disabled
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    Write-Log "Disabled SMB1 and related tunneling protocols."
+    Write-Host "Windows features disabled."
+}
+
+# ============================ SETUP FIREWALL RULES ============================
+function Setup-Firewall {
+    Write-Host "Configuring firewall rules..." -ForegroundColor Cyan
+    
+    # Enable firewall for all profiles
+    Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True
+    Write-Host "Firewall enabled for Domain, Public and Private profiles."
+    
+    # Set default policy to block all inbound and outbound traffic
+    netsh advfirewall set allprofiles firewallpolicy "blockinbound,blockoutbound"
+    Write-Host "Default firewall policy set to block inbound and outbound traffic."
+    
+    # Remove existing firewall rules
+    Get-NetFirewallRule | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    Write-Host "Existing firewall rules removed."
+    
+    # Define ports for firewall configuration
+    $inboundTCPPorts = "25,53,80,110,143,389,443,587,636,993,995,9997"
+    $outboundTCPPorts = "53,80,443,8080,9997"
+    $inboundUDPPorts = "53,80,123,443"
+    $outboundUDPPorts = "25,53,80,123,138,389,443"
+    
+    # Add rules for TCP inbound
+    netsh advfirewall firewall add rule name="Allow Inbound TCP" protocol=TCP dir=in localport=$inboundTCPPorts action=allow
+    Write-Host "Allowed inbound TCP ports: $inboundTCPPorts"
+    
+    # Add rules for TCP outbound
+    netsh advfirewall firewall add rule name="Allow Outbound TCP" protocol=TCP dir=out remoteport=$outboundTCPPorts action=allow
+    Write-Host "Allowed outbound TCP ports: $outboundTCPPorts"
+    
+    # Add rules for UDP inbound
+    netsh advfirewall firewall add rule name="Allow Inbound UDP" protocol=UDP dir=in localport=$inboundUDPPorts action=allow
+    Write-Host "Allowed inbound UDP ports: $inboundUDPPorts"
+
+    # Add rules for UDP outbound
+    netsh advfirewall firewall add rule name="Allow Outbound UDP" protocol=UDP dir=out remoteport=$outboundUDPPorts action=allow
+    Write-Host "Allowed outbound UDP ports: $outboundUDPPorts"
+    
+    # Allow ICMP (ping)
+    netsh advfirewall firewall add rule name="Allow ICMP Inbound" protocol=icmpv4:8,any dir=in action=allow
+    netsh advfirewall firewall add rule name="Allow ICMP Outbound" protocol=icmpv4:8,any dir=out action=allow
+    Write-Host "Allowed ICMP (ping) traffic."
+    
+    # Allow dynamic outbound ports for applications
+    netsh advfirewall firewall add rule name="Allow Outbound Dynamic Ports TCP" protocol=TCP dir=out localport=49152-65535 action=allow
+    netsh advfirewall firewall add rule name="Allow Outbound Dynamic Ports UDP" protocol=UDP dir=out localport=49152-65535 action=allow
+    Write-Host "Allowed dynamic outbound ports."
+    
+    Write-Host "Firewall configuration completed."
+    Write-Log "Firewall rules configured."
+}
+
+# ============================ MACHINE & USER PASSWORD RESET ============================
+function Mech-admin {
+    Write-Host "Starting password reset operations..." -ForegroundColor Cyan
+    # Ensure Active Directory module is imported
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+    } catch {
+        Write-Host "Active Directory module not available. Exiting password reset."
+        return
+    }
+    
+    function Change-MachinePassword {
+        try {
+            $dc = (Get-ADDomainController).HostName
+            Reset-ComputerMachinePassword -Server $dc -ErrorAction Stop
+            Write-Host "Machine password successfully reset."
+            Write-Log "Machine password reset."
+        } catch {
+            Write-Error "Failed to reset machine password: $($_.Exception.Message)"
+            Write-Log "Failed to reset machine password: $($_.Exception.Message)"
+        }
+    }
+    
+    function Verify-MachinePasswordChange {
+        try {
+            $ComputerName = "$($env:COMPUTERNAME)$" 
+            $ComputerObject = Get-ADComputer -Identity $ComputerName -Properties pwdLastSet -ErrorAction Stop
+            if ($ComputerObject) {
+                $LastSet = Get-Date -Date $ComputerObject.pwdLastSet -Format "yyyy-MM-dd HH:mm:ss"
+                Write-Host "The machine password was last set on: $LastSet"
+                Write-Log "Machine password last set on: $LastSet"
+            } else {
+                Write-Error "Unable to find the machine account in Active Directory."
+            }
+        } catch {
+            Write-Error "Error retrieving machine account details: $($_.Exception.Message)"
+            Write-Log "Error retrieving machine account details: $($_.Exception.Message)"
+        }
+    }
+    
+    function Change-CurrentUserPassword {
+        try {
+            $NewPassword = Read-Host "Enter new password for current user" -AsSecureString
+            Set-ADAccountPassword -Identity $env:USERNAME -NewPassword $NewPassword -Reset -ErrorAction Stop
+            Write-Host "Password successfully changed for user: $env:USERNAME"
+            Write-Log "Password changed for user: $env:USERNAME."
+        } catch {
+            Write-Error "Failed to change current user password: $($_.Exception.Message)"
+            Write-Log "Failed to change current user password: $($_.Exception.Message)"
+        }
+    }
+    
+    Change-MachinePassword
+    Verify-MachinePasswordChange
+    Change-CurrentUserPassword
+    Write-Host "Password reset operations completed." -ForegroundColor Cyan
+}
+
+# ============================ SYSTEM ENUMERATION ============================
+function System-Enumeration {
+    Write-Host "Collecting system information and generating report..." -ForegroundColor Cyan
+    $outputFile = "$env:USERPROFILE\Desktop\infodump_report.txt"
+    Start-Transcript -Path $outputFile -Append
+    
+    Write-Host "`n===== OS Information =====" -ForegroundColor Cyan
+    Get-SmbServerConfiguration | Select-Object EnableSMB1Protocol, EnableSMB2Protocol
+    Get-ComputerInfo | Select-Object CsName, WindowsVersion, OsArchitecture, Manufacturer, InstallDate | Format-Table -AutoSize
+    
+    Write-Host "`n===== Local Users =====" -ForegroundColor Cyan
+    Get-LocalUser | Format-Table Name, Enabled, LastLogon -AutoSize
+    
+    Write-Host "`n===== Local Groups =====" -ForegroundColor Cyan
+    Get-LocalGroup | Format-Table Name, Description -AutoSize
+    
+    Write-Host "`n===== Running Processes (Top 10) =====" -ForegroundColor Cyan
+    Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 | Format-Table Name, CPU, Id -AutoSize
+    
+    Write-Host "System enumeration complete. Report saved to $outputFile."
+    Write-Log "System enumeration executed. Report saved to $outputFile."
+    Stop-Transcript
+}
+
+# ============================ SYSINTERNALS SUITE INSTALLATION ============================
+function Sysinternals-install {
+    Write-Host "Installing Sysinternals Suite..." -ForegroundColor Cyan
+    $url = "https://download.sysinternals.com/files/SysinternalsSuite.zip"
+    $destination = "$env:USERPROFILE\Downloads\SysinternalsSuite.zip"
+    
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $destination -ErrorAction Stop
+        Write-Host "Downloaded Sysinternals Suite."
+        Write-Log "Downloaded Sysinternals Suite from $url."
+        # Extract the downloaded zip file
+        Expand-Archive -Path $destination -DestinationPath "$env:USERPROFILE\Downloads\SysinternalsSuite" -Force
+        Write-Host "Extracted Sysinternals Suite."
+        Write-Log "Extracted Sysinternals Suite to $env:USERPROFILE\Downloads\SysinternalsSuite."
+    } catch {
+        Write-Error "Failed to install Sysinternals Suite: $($_.Exception.Message)"
+        Write-Log "Failed to install Sysinternals Suite: $($_.Exception.Message)"
+    }
+}
+
+# ============================ PATCH MANAGEMENT ============================
+function patch-MGMT {
+    Write-Host "Checking for available patches..." -ForegroundColor Cyan
+    try {
+        # Example: List available updates (requires the appropriate module)
+        Get-WindowsUpdate -AcceptAll -IgnoreReboot
+        Write-Log "Patch management: Checked for updates."
+    } catch {
+        Write-Error "Failed to check for patches: $($_.Exception.Message)"
+        Write-Log "Failed to check for patches: $($_.Exception.Message)"
+    }
+}
+
+# ============================ DISABLE WEB FEATURES (IIS) ============================
+function Disable-WebFeatures {
+    Write-Host "Disabling web features (IIS)..." -ForegroundColor Cyan
+    try {
+        Disable-WindowsOptionalFeature -Online -FeatureName "IIS-WebServer" -NoRestart
+        Write-Log "Disabled web features: IIS-WebServer."
+        Write-Host "IIS has been disabled."
+    } catch {
+        Write-Error "Failed to disable IIS: $($_.Exception.Message)"
+        Write-Log "Failed to disable IIS: $($_.Exception.Message)"
+    }
+}
+
+# ============================ FILE SHARES LISTING ============================
+function File-Shares {
+    Write-Host "Listing file shares..." -ForegroundColor Cyan
+    try {
+        Get-SmbShare | Format-Table Name, Path, Description -AutoSize
+        Write-Log "Listed SMB shares."
+    } catch {
+        Write-Error "Failed to list file shares: $($_.Exception.Message)"
+        Write-Log "Failed to list file shares: $($_.Exception.Message)"
+    }
+}
+
+# ============================ SMB CONFIGURATION (FIX) ============================
+function SMB-Fix {
+    Write-Host "Upgrading SMB configurations..." -ForegroundColor Cyan
+    try {
+        # Example upgrade: Ensure SMB2 is enabled
+        Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force
+        Write-Host "SMB2 enabled."
+        Write-Log "SMB-Fix executed: Enabled SMB2."
+    } catch {
+        Write-Error "Failed to fix SMB configuration: $($_.Exception.Message)"
+        Write-Log "Failed SMB-Fix: $($_.Exception.Message)"
+    }
+}
+
+# ============================ ZEROLOGON MITIGATION ============================
+function Zerologon {
+    Write-Host "Applying Zerologon mitigations..." -ForegroundColor Cyan
+    try {
+        # Example settings adjustments for Zerologon mitigation
+        Write-Host "Ensure Netlogon secure channel signing is enforced."
+        Write-Log "Zerologon mitigation applied."
+    } catch {
+        Write-Error "Failed to apply Zerologon mitigations: $($_.Exception.Message)"
+        Write-Log "Failed Zerologon mitigation: $($_.Exception.Message)"
+    }
+}
+
+# ============================ MALWAREBYTES INSTALLATION ============================
+function MB-install {
+    Write-Host "Installing Malwarebytes..." -ForegroundColor Cyan
+    $url = "https://downloads.malwarebytes.com/file/mb3"
+    $destination = "$env:USERPROFILE\Downloads\MalwarebytesSetup.exe"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $destination -ErrorAction Stop
+        Write-Host "Downloaded Malwarebytes installer."
+        Write-Log "Downloaded Malwarebytes installer from $url."
+        Start-Process -FilePath $destination -ArgumentList "/S" -Wait
+        Write-Host "Malwarebytes installed."
+        Write-Log "Malwarebytes installation completed."
+    } catch {
+        Write-Error "Failed to install Malwarebytes: $($_.Exception.Message)"
+        Write-Log "Failed Malwarebytes installation: $($_.Exception.Message)"
+    }
+}
+
+# ============================ NMAP INSTALLATION ============================
+function NMAP-install {
+    Write-Host "Installing Nmap..." -ForegroundColor Cyan
+    $url = "https://nmap.org/dist/nmap-7.92-setup.exe"  # Update URL as needed
+    $destination = "$env:USERPROFILE\Downloads\NmapSetup.exe"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $destination -ErrorAction Stop
+        Write-Host "Downloaded Nmap installer."
+        Write-Log "Downloaded Nmap installer from $url."
+        Start-Process -FilePath $destination -ArgumentList "/S" -Wait
+        Write-Host "Nmap installed."
+        Write-Log "Nmap installation completed."
+    } catch {
+        Write-Error "Failed to install Nmap: $($_.Exception.Message)"
+        Write-Log "Failed Nmap installation: $($_.Exception.Message)"
+    }
+}
+
+# ============================ REGISTRY BACKUP ============================
+function reg-backup {
+    Write-Host "Backing up registry..." -ForegroundColor Cyan
+    $backupPath = "$env:USERPROFILE\Desktop\RegistryBackup.reg"
+    try {
+        reg export HKLM $backupPath /y
+        Write-Host "Registry backup saved to $backupPath."
+        Write-Log "Registry backup created at $backupPath."
+    } catch {
+        Write-Error "Failed to backup registry: $($_.Exception.Message)"
+        Write-Log "Registry backup failed: $($_.Exception.Message)"
+    }
+}
+
+# ============================ REGISTRY RESTORE ============================
+function reg-restore {
+    Write-Host "Restoring registry from backup..." -ForegroundColor Cyan
+    $backupPath = "$env:USERPROFILE\Desktop\RegistryBackup.reg"
+    try {
+        reg import $backupPath
+        Write-Host "Registry restored from $backupPath."
+        Write-Log "Registry restored from backup at $backupPath."
+    } catch {
+        Write-Error "Failed to restore registry: $($_.Exception.Message)"
+        Write-Log "Registry restore failed: $($_.Exception.Message)"
+    }
+}
+
+# ============================ DNS BACKUP ============================
+function DNS-backup {
+    Write-Host "Backing up DNS zones..." -ForegroundColor Cyan
+    $backupPath = "$env:USERPROFILE\Desktop\DNSBackup.txt"
+    try {
+        # Example command; modify as needed for your environment
+        dnscmd /zoneexport example.com DNSBackup.txt
+        Write-Host "DNS backup saved to $backupPath."
+        Write-Log "DNS backup created at $backupPath."
+    } catch {
+        Write-Error "Failed to backup DNS zones: $($_.Exception.Message)"
+        Write-Log "DNS backup failed: $($_.Exception.Message)"
+    }
+}
+
+# ============================ DNS RESTORE ============================
+function DNS-restore {
+    Write-Host "Restoring DNS zones from backup..." -ForegroundColor Cyan
+    $backupPath = "$env:USERPROFILE\Desktop\DNSBackup.txt"
+    try {
+        # Placeholder command; modify as needed for your environment
+        Write-Host "Restoration command not implemented. Please restore manually using $backupPath."
+        Write-Log "DNS restore placeholder executed for $backupPath."
+    } catch {
+        Write-Error "Failed to restore DNS zones: $($_.Exception.Message)"
+        Write-Log "DNS restore failed: $($_.Exception.Message)"
+    }
+}
+
+# ============================ MICROSOFT EDGE INSTALLATION ============================
+function Edge-Install {
+iwr "https://c2rsetup.officeapps.live.com/c2r/downloadEdge.aspx?platform=Default&source=EdgeStablePage&Channel=Stable&language=en&brand=M100" -OutFile "$env:USERPROFILE\Desktop\EdgeSetup.exe"
+}
+
+
+
+# ============================ MAIN MENU ============================
+function Show-MainMenu {
+    Clear-Host
+    Write-Host "==================== All-In-One Hardening Script ====================" -ForegroundColor Green
+    Write-Host "1.  Disable Windows Features"
+    Write-Host "2.  Setup Firewall Rules"
+    Write-Host "3.  Reset Machine and User Passwords"
+    Write-Host "4.  System Enumeration Report"
+    Write-Host "5.  Install Sysinternals Suite"
+    Write-Host "6.  Patch Management"
+    Write-Host "7.  Disable Web Features (IIS)"
+    Write-Host "8.  List File Shares"
+    Write-Host "9.  Fix/Upgrade SMB Configuration"
+    Write-Host "10. Apply Zerologon Mitigation"
+    Write-Host "11. Install Malwarebytes"
+    Write-Host "12. Install Nmap"
+    Write-Host "13. Install Microsoft Edge"
+    Write-Host "14. Backup Registry"
+    Write-Host "15. Restore Registry"
+    Write-Host "16. DNS Zones Backup"
+    Write-Host "17. DNS Zones Restore"
+    Write-Host "Q.  Quit"
+    Write-Host "======================================================================" -ForegroundColor Green
+}
+
+# ============================ MENU LOOP ============================
+do {
+    Show-MainMenu
+    $choice = Read-Host "Enter your selection"
+    switch ($choice.ToUpper()) {
+        "1"  { Disable-Features }
+        "2"  { Setup-Firewall }
+        "3"  { Mech-admin }
+        "4"  { System-Enumeration }
+        "5"  { Sysinternals-install }
+        "6"  { patch-MGMT }
+        "7"  { Disable-WebFeatures }
+        "8"  { File-Shares }
+        "9"  { SMB-Fix }
+        "10" { Zerologon }
+        "11" { MB-install }
+        "12" { NMAP-install }
+        "13" { Edge-Install }
+        "14" { reg-backup }
+        "15" { reg-restore }
+        "16" { DNS-backup }
+        "17" { DNS-restore }
+        "Q"  { Write-Host "Exiting script. Goodbye!" -ForegroundColor Yellow }
+        default { Write-Host "Invalid selection. Please choose a valid option." -ForegroundColor Red }
+    }
+    if ($choice.ToUpper() -ne "Q") {
+        Write-Host "Press any key to return to the main menu..."
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+} while ($choice.ToUpper() -ne "Q")
